@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Environment
+.env
+backend/.env
+
+# Data
+backend/data/*.db
+backend/data/*.json
+backend/data/knowledge_base/
+
+# Logs
+backend/logs/*.log
+backend/logs/*.log.*
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+.codegraph/
+
+# Internal
+ask.txt
+ask_answers.md
+
+# Docker (not tested)
+Dockerfile
+docker-compose.yml
+
+# Auto-generated
+frontend/package-lock.json
