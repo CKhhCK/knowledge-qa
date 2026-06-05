@@ -84,48 +84,90 @@ npm run dev
 
 ## 智能体协作流程
 
-```
-用户提问
-  │
-  ▼
-QuestionRouter（规则 + LLM 双通道分类）
-  │ 输出: category + complexity（simple / complex）
-  ▼
-Handler Dispatch（策略模式分发）
-  ├── factual    → FactualHandler   （知识库检索 → LLM 生成）
-  ├── reasoning  → ReasoningHandler （ReAct 循环，启动前先查知识库）
-  ├── comparison → ComparisonHandler（Plan-and-Solve 分解执行）
-  ├── calculation→ CalculationHandler（CoT 提取表达式 → CalculatorTool）
-  └── mixed      → MixedHandler     （分解 → 并行分派 → 综合）
-  │
-  ▼
-Retrieval Pipeline（知识库检索）
-  ├── 1. 向量搜索（Qwen3 嵌入 + 余弦相似度）
-  ├── 2. 结果不足 → 升级 HyDE + MQE（LLM 查询扩展）
-  └── 3. Rerank（LLM 重排序）
-  │
-  ▼
-ReflectionVerifier（仅复杂问题）
-  └── 审核 → 评分 → 不合格则优化重写
-  │
-  ▼
-来源标注 + 记忆存储 → 流式返回
+```mermaid
+flowchart TD
+    Q[用户提问] --> R[QuestionRouter]
+    R -->|规则命中| C{分类结果}
+    R -->|规则不足| L[LLM 分类]
+    L --> C
+    C --> D{complexity?}
+    
+    D -->|simple| F1[FactualHandler]
+    D -->|simple| C1[CalculationHandler]
+    D -->|complex| F2[ReasoningHandler]
+    D -->|complex| F3[ComparisonHandler]
+    D -->|complex| F4[MixedHandler]
+    
+    F1 --> KB[知识库检索]
+    F2 --> KB2[先查知识库] --> RA[ReAct 循环]
+    F3 --> PS[Plan-and-Solve]
+    F4 --> DC[分解 → 并行分派]
+    
+    KB --> S{结果充足?}
+    S -->|是| GEN[LLM 生成回答]
+    S -->|否| ADV[HyDE + MQE 增强检索]
+    ADV --> GEN
+    
+    RA --> GEN
+    PS --> GEN
+    DC --> GEN
+    
+    GEN --> RF{complexity=simple?}
+    RF -->|是| OUT[返回回答]
+    RF -->|否| RV[Reflection 审核]
+    RV -->|通过| OUT
+    RV -->|不通过| FIX[优化重写] --> OUT
 ```
 
 ### 简单 vs 复杂
 
-| | 简单问题 | 复杂问题 |
-|---|---|---|
-| 分类 | 规则命中，0ms | LLM 分类，~2s |
-| 检索 | 向量搜索 | HyDE + MQE 增强 |
-| Reflection | ☓ 跳过 | ✅ 执行 |
-| LLM 调用 | 1 次 | 4-5 次 |
-| 总耗时 | ~4s | ~20s |
-| 示例 | "CEO 是谁" | "为什么 Transformer 更好" |
+```mermaid
+flowchart LR
+    subgraph Simple[简单问题 ~4s]
+        S1[规则分类 0ms] --> S2[向量搜索 600ms]
+        S2 --> S3[LLM 生成 3s]
+        S3 --> S4[返回 跳过Reflection]
+    end
+    subgraph Complex[复杂问题 ~20s]
+        C1[LLM分类 2s] --> C2[HyDE+MQE 8s]
+        C2 --> C3[LLM生成 5s]
+        C3 --> C4[Reflection 4s]
+    end
+```
 
 ---
 
+## 检索流程
+
+```mermaid
+flowchart TD
+    U[用户提问] --> C{知识库有文档?}
+    C -->|否| W[Web Search 兜底]
+    C -->|是| E[Qwen3 嵌入查询 600ms]
+    E --> VS[向量余弦相似度搜索]
+    VS --> R{Top-1 分数 > 0.3?}
+    R -->|是| RK[返回 Top-5 片段]
+    R -->|否| MQ[HyDE + MQE 查询扩展]
+    MQ -->|LLM 生成变体| VS2[多查询向量搜索]
+    VS2 --> DD[按 max-score 去重合并]
+    DD --> RR[LLM Rerank 重排序]
+    RR --> RK
+    RK --> LLM[注入 LLM Prompt 生成回答]
+```
+
 ## 记忆系统
+
+```mermaid
+flowchart LR
+    MSG[对话消息] --> SS[会话历史 SQLite]
+    MSG -->|时间指代触发| EM[长期记忆 SQLite]
+    EM -->|语义搜索| CTX[注入 LLM 上下文]
+    SS -->|页面加载| HIS[恢复聊天界面]
+    
+    DOC[上传文档] --> CHK[分块策略选择]
+    CHK --> IDX[嵌入 + 向量索引 SQLite]
+    IDX --> KB[知识库检索]
+```
 
 | 类型 | 存储 | 触发条件 |
 |------|------|----------|
