@@ -34,6 +34,16 @@ class SessionStore:
 
     def _init_db(self):
         with self._lock:
+            # Remove corrupted/empty DB file so SQLite creates a clean one
+            if os.path.exists(self._db_path):
+                try:
+                    test = sqlite3.connect(self._db_path)
+                    test.execute("SELECT 1 FROM conversations LIMIT 1")
+                    test.close()
+                except Exception:
+                    test.close()
+                    os.remove(self._db_path)
+
             conn = sqlite3.connect(self._db_path)
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS conversations (

@@ -67,8 +67,8 @@ async def send_message(
     except QAAgentError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
     except Exception as e:
-        logger.error("Unhandled error in chat endpoint", extra={"error": str(e)})
-        raise HTTPException(status_code=500, detail="Internal server error")
+        logger.error(f"Unhandled error in chat endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 
 @router.post("/stream")

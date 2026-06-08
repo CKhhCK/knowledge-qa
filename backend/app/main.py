@@ -17,7 +17,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import get_settings, Settings
 from app.core.agent import AdvancedQAAgent
-from app.api.routes import chat, health, admin, documents
+from app.api.routes import chat, health, admin, documents, llm as llm_routes
 from app.auth.routes import router as auth_router
 from app.utils.logging import setup_logging, get_logger
 
@@ -195,6 +195,7 @@ def create_app() -> FastAPI:
     app.include_router(chat.router, prefix="/api/v1")
     app.include_router(documents.router, prefix="/api/v1")
     app.include_router(admin.router, prefix="/api/v1")
+    app.include_router(llm_routes.router, prefix="/api/v1")
 
     return app
 

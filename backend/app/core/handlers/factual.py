@@ -87,11 +87,10 @@ class FactualHandler(HandlerInterface):
         if has_kb:
             t0 = time.perf_counter()
             try:
-                # Simple search first (fast), upgrade to HyDE+MQE only if needed
+                # Simple search first (fast). Upgrade to HyDE+MQE only if needed.
                 kb_answer = await self.knowledge.ask_knowledge(
                     question, limit=5, enable_advanced=False, include_citations=True
                 )
-                # If simple search found nothing useful, try advanced
                 if not kb_answer or len(kb_answer) < 50:
                     logger.info("Simple search insufficient, trying advanced (HyDE+MQE)")
                     kb_answer = await self.knowledge.ask_knowledge(

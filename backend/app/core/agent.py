@@ -118,7 +118,7 @@ class AdvancedQAAgent:
         }
         # MixedHandler needs the router for recursive classification
         self.handlers["mixed"] = MixedHandler(
-            self.llm, self.tool_registry, self.settings, self.router
+            self.llm, self.tool_registry, self.settings, self.router, self.knowledge
         )
 
         # Session store (conversation history)
@@ -171,6 +171,31 @@ class AdvancedQAAgent:
                 f"[CLASSIFY] {classification.category} (conf={classification.confidence:.2f}) | "
                 f"{(time.perf_counter()-t0)*1000:.0f}ms"
             )
+
+            # Step 1.5: Universal KB pre-check — always try KB first
+            # If KB has content, use factual handler regardless of classification.
+            # Exception: mixed questions have their own decomposition + KB pipeline.
+            kb_prechecked = False
+            if (
+                classification.category != "mixed"
+                and self.knowledge
+                and self.knowledge.has_knowledge()
+            ):
+                kb_answer = await self.knowledge.ask_knowledge(
+                    question, limit=5, enable_advanced=False, include_citations=True
+                )
+                if kb_answer and len(kb_answer) > 50:
+                    # KB has meaningful content → redirect to factual
+                    logger.info(
+                        f"[KB-PRECHECK] KB hit ({len(kb_answer)} chars), "
+                        f"redirecting {classification.category} → factual"
+                    )
+                    classification = ClassificationResult(
+                        category="factual",
+                        confidence=0.9,
+                        reasoning=f"知识库命中，从{classification.category}重定向到factual",
+                    )
+                    kb_prechecked = True
 
             # Step 2: Dispatch to the appropriate handler
             handler = self.handlers.get(classification.category)

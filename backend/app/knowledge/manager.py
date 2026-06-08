@@ -33,16 +33,81 @@ logger = get_logger(__name__)
 
 
 # ================================================================
-# Vector Index (embedding-based semantic search)
+# BM25 + Vector Hybrid Index
 # ================================================================
 
+from collections import Counter
+from math import log
+
+class BM25Index:
+    """BM25 keyword search — exact matching for numbers, code, proper nouns."""
+
+    def __init__(self, k1: float = 1.2, b: float = 0.75):
+        self.k1 = k1; self.b = b
+        self._chunks: list[str] = []          # chunk text
+        self._chunk_ids: list[tuple] = []      # (doc_id, chunk_idx)
+        self._df: Counter = Counter()          # document frequency
+        self._avg_len = 0
+        self._total = 0
+
+    def add_document(self, doc_id: str, chunks: list[str]):
+        for i, c in enumerate(chunks):
+            self._chunk_ids.append((doc_id, i))
+            self._chunks.append(c)
+            for term in set(self._tokenize(c)):
+                self._df[term] += 1
+        self._avg_len = sum(len(c) for c in self._chunks) / max(len(self._chunks), 1)
+        self._total = len(self._chunks)
+
+    def remove_document(self, doc_id: str):
+        indices = [j for j, (d, _) in enumerate(self._chunk_ids) if d == doc_id]
+        for j in reversed(indices):
+            for term in set(self._tokenize(self._chunks[j])):
+                self._df[term] = max(0, self._df[term] - 1)
+            del self._chunks[j]; del self._chunk_ids[j]
+        self._total = len(self._chunks)
+        self._avg_len = sum(len(c) for c in self._chunks) / max(self._total, 1)
+
+    def search(self, query: str, limit: int = 5) -> list[dict]:
+        terms = self._tokenize(query)
+        if not terms: return []
+        scores = []
+        for idx, chunk in enumerate(self._chunks):
+            score = 0.0
+            doc_len = len(chunk)
+            for term in terms:
+                tf = chunk.lower().count(term)
+                if tf == 0: continue
+                df = self._df.get(term, 0)
+                idf = log((self._total - df + 0.5) / (df + 0.5) + 1)
+                score += idf * (tf * (self.k1 + 1)) / (tf + self.k1 * (1 - self.b + self.b * doc_len / max(self._avg_len, 1)))
+            if score > 0:
+                scores.append((score, idx))
+        scores.sort(key=lambda x: x[0], reverse=True)
+        return [{"score": round(s, 4), "chunk_idx": self._chunk_ids[i][1],
+                 "document_id": self._chunk_ids[i][0], "chunk": self._chunks[i]} for s, i in scores[:limit]]
+
+    def _tokenize(self, text: str) -> list[str]:
+        tokens = []
+        for word in re.findall(r'[一-鿿]+|[a-z0-9]+|\d+\.?\d*%?', text.lower()):
+            if len(word) >= 1: tokens.append(word)
+        return tokens
+
+    def clear(self):
+        self._chunks.clear(); self._chunk_ids.clear(); self._df.clear()
+        self._avg_len = 0; self._total = 0
+
+
 class VectorIndex:
-    """Semantic search index with SQLite persistence — survives restarts."""
+    """Semantic search index with SQLite persistence + BM25 hybrid search."""
+
+    RRF_K = 60  # Reciprocal Rank Fusion constant
 
     def __init__(self, db_path: str = "./data/vector_index.db"):
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self._db_path = db_path
         self._lock = threading.RLock()
+        self._bm25 = BM25Index()
         self._init_db()
         self._chunks: list[dict] = []
         self._documents: dict[str, dict] = {}
@@ -53,10 +118,8 @@ class VectorIndex:
             conn = sqlite3.connect(self._db_path)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS doc_chunks (
-                    doc_id TEXT NOT NULL,
-                    chunk_idx INTEGER NOT NULL,
-                    text TEXT NOT NULL,
-                    embedding TEXT NOT NULL,
+                    doc_id TEXT NOT NULL, chunk_idx INTEGER NOT NULL,
+                    text TEXT NOT NULL, embedding TEXT NOT NULL,
                     metadata TEXT DEFAULT '{}',
                     PRIMARY KEY (doc_id, chunk_idx)
                 )
@@ -65,87 +128,104 @@ class VectorIndex:
             conn.commit(); conn.close()
 
     def _load_from_db(self):
-        """Restore index from SQLite on startup."""
         with self._lock:
             conn = sqlite3.connect(self._db_path)
-            for row in conn.execute("SELECT doc_id, chunk_idx, text, embedding, metadata FROM doc_chunks"):
-                self._chunks.append({
-                    "doc_id": row[0], "chunk_idx": row[1],
-                    "text": row[2], "embedding": json.loads(row[3]),
-                })
-                if row[0] not in self._documents:
-                    self._documents[row[0]] = json.loads(row[4]) if row[4] else {}
+            rows = list(conn.execute("SELECT doc_id, chunk_idx, text, embedding, metadata FROM doc_chunks"))
             conn.close()
+        for row in rows:
+            self._chunks.append({"doc_id": row[0], "chunk_idx": row[1], "text": row[2], "embedding": json.loads(row[3])})
+            if row[0] not in self._documents:
+                self._documents[row[0]] = json.loads(row[4]) if row[4] else {}
+        # Rebuild BM25 from loaded chunks
+        for doc_id in self._documents:
+            chunks = [c["text"] for c in self._chunks if c["doc_id"] == doc_id]
+            if chunks: self._bm25.add_document(doc_id, chunks)
         if self._chunks:
-            logger.info(f"Loaded {len(self._chunks)} chunks ({len(self._documents)} docs) from index")
+            logger.info(f"Loaded {len(self._chunks)} chunks ({len(self._documents)} docs) + BM25")
 
     def add_document(self, doc_id: str, chunks: list[str], metadata: dict = None):
-        """Index document chunks with embeddings. Persists to SQLite."""
-        if not chunks:
-            return
-
+        if not chunks: return
         logger.info(f"Embedding {len(chunks)} chunks for '{doc_id}' ({get_embedding_dim()}d)...")
         t0 = time.perf_counter()
         embeddings = embed_documents(chunks)
-        elapsed = (time.perf_counter() - t0) * 1000
-        logger.info(f"Embedded {len(chunks)} chunks in {elapsed:.0f}ms")
-
+        logger.info(f"Embedded {len(chunks)} chunks in {(time.perf_counter()-t0)*1000:.0f}ms")
         meta_json = json.dumps(metadata or {}, ensure_ascii=False)
         with self._lock:
             conn = sqlite3.connect(self._db_path)
             for i, (chunk, emb) in enumerate(zip(chunks, embeddings)):
-                conn.execute(
-                    "INSERT OR REPLACE INTO doc_chunks (doc_id, chunk_idx, text, embedding, metadata) VALUES (?,?,?,?,?)",
-                    (doc_id, i, chunk, json.dumps(emb), meta_json),
-                )
+                conn.execute("INSERT OR REPLACE INTO doc_chunks VALUES (?,?,?,?,?)",
+                             (doc_id, i, chunk, json.dumps(emb), meta_json))
                 self._chunks.append({"doc_id": doc_id, "chunk_idx": i, "text": chunk, "embedding": emb})
             conn.commit(); conn.close()
-
         self._documents[doc_id] = metadata or {}
+        self._bm25.add_document(doc_id, chunks)
 
     def remove_document(self, doc_id: str):
-        """Remove document from index and SQLite."""
         with self._lock:
             conn = sqlite3.connect(self._db_path)
             conn.execute("DELETE FROM doc_chunks WHERE doc_id = ?", (doc_id,))
             conn.commit(); conn.close()
         self._chunks = [c for c in self._chunks if c["doc_id"] != doc_id]
         self._documents.pop(doc_id, None)
+        self._bm25.remove_document(doc_id)
 
-    def search(self, query_embedding: list[float], limit: int = 5,
-               score_threshold: float = 0.0) -> list[dict]:
-        """Search by embedding vector using cosine similarity."""
-        if not self._chunks:
-            return []
-
+    def search_vector(self, query_embedding: list[float], limit: int = 10,
+                      score_threshold: float = 0.0) -> list[dict]:
+        """Pure vector search."""
+        if not self._chunks: return []
         scored = []
         for chunk in self._chunks:
             score = cosine_similarity(query_embedding, chunk["embedding"])
             if score >= score_threshold:
-                scored.append({
-                    "document_id": chunk["doc_id"],
-                    "score": round(score, 4),
-                    "chunk": chunk["text"],
-                    "chunk_idx": chunk["chunk_idx"],
-                    "metadata": self._documents.get(chunk["doc_id"], {}),
-                })
-
+                scored.append({"document_id": chunk["doc_id"], "score": round(score, 4),
+                               "chunk": chunk["text"], "chunk_idx": chunk["chunk_idx"],
+                               "metadata": self._documents.get(chunk["doc_id"], {})})
         scored.sort(key=lambda x: x["score"], reverse=True)
         return scored[:limit]
+
+    def search_hybrid(self, query: str, query_embedding: list[float],
+                      limit: int = 5) -> list[dict]:
+        """BM25 + Vector hybrid search using Reciprocal Rank Fusion."""
+        # Get results from both methods (more candidates)
+        bm25_results = self._bm25.search(query, limit=limit * 3)
+        vector_results = self.search_vector(query_embedding, limit=limit * 3)
+
+        # Weighted RRF: vector 2x (better semantic understanding), BM25 1x (keyword precision)
+        rrf_scores: dict[str, float] = {}
+        chunk_map: dict[str, dict] = {}
+
+        for rank, r in enumerate(bm25_results):
+            key = f"{r['document_id']}_{r['chunk_idx']}"
+            rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (self.RRF_K + rank + 1)
+            chunk_map[key] = r
+
+        for rank, r in enumerate(vector_results):
+            key = f"{r['document_id']}_{r['chunk_idx']}"
+            rrf_scores[key] = rrf_scores.get(key, 0) + 2.0 / (self.RRF_K + rank + 1)  # 2x weight
+            if key not in chunk_map:
+                chunk_map[key] = r
+            if key not in chunk_map:
+                chunk_map[key] = r
+
+        # Sort by RRF score
+        merged = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        results = []
+        for key, rrf_score in merged[:limit]:
+            r = chunk_map[key]
+            r["score"] = round(rrf_score, 4)
+            results.append(r)
+        return results
 
     def clear(self):
         with self._lock:
             conn = sqlite3.connect(self._db_path)
             conn.execute("DELETE FROM doc_chunks"); conn.commit(); conn.close()
         self._chunks.clear(); self._documents.clear()
+        self._bm25.clear()
 
     def stats(self) -> dict:
-        return {
-            "total_chunks": len(self._chunks),
-            "total_documents": len(self._documents),
-            "embedding_dimension": get_embedding_dim(),
-            "document_ids": list(self._documents.keys()),
-        }
+        return {"total_chunks": len(self._chunks), "total_documents": len(self._documents),
+                "embedding_dimension": get_embedding_dim(), "document_ids": list(self._documents.keys())}
 
 
 # ================================================================
@@ -660,7 +740,7 @@ class KnowledgeManager:
         if len(queries) == 1:
             # Simple search
             q_emb = embed_query(query)
-            results = self._index.search(q_emb, limit=limit * 2 if enable_rerank else limit)
+            results = self._index.search_hybrid(query, q_emb, limit=limit * 2 if enable_rerank else limit)
         else:
             # Multi-query search with dedup
             all_results: dict[str, dict] = {}  # doc_id+chunk_idx -> result
@@ -668,7 +748,7 @@ class KnowledgeManager:
 
             for q in queries:
                 q_emb = embed_query(q)
-                batch = self._index.search(q_emb, limit=slots)
+                batch = self._index.search_vector(q_emb, limit=slots)
                 for r in batch:
                     key = f"{r['document_id']}_{r['chunk_idx']}"
                     if key not in all_results or r["score"] > all_results[key]["score"]:
@@ -685,9 +765,43 @@ class KnowledgeManager:
         return results[:limit]
 
     def search_simple(self, query: str, limit: int = 5) -> list[dict]:
-        """Fast vector search without HyDE/MQE (no LLM calls)."""
+        """Pure vector search, no LLM calls."""
         q_emb = embed_query(query)
-        return self._index.search(q_emb, limit=limit)
+        return self._index.search_vector(q_emb, limit=limit)
+
+    def search_multi_query(self, queries: list[str], limit: int = 5) -> list[dict]:
+        """
+        Search with multiple query variants independently, merge by max-score dedup.
+
+        Each query gets its own vector search. Results are merged with
+        max-score dedup (same chunk found by multiple queries keeps highest score).
+        Ideal for compound questions decomposed into sub-queries.
+        No LLM calls — embedding only.
+        """
+        if not queries:
+            return []
+        if len(queries) == 1:
+            return self.search_simple(queries[0], limit=limit)
+
+        # Search each query independently
+        all_results: dict[str, dict] = {}  # key = "doc_id_chunk_idx" -> result
+        slots = max(limit * 2 // len(queries), 3)  # per-query limit
+
+        for q in queries:
+            q_emb = embed_query(q)
+            batch = self._index.search_vector(q_emb, limit=slots)
+            for r in batch:
+                key = f"{r['document_id']}_{r['chunk_idx']}"
+                if key not in all_results or r["score"] > all_results[key]["score"]:
+                    all_results[key] = r
+
+        # Sort by score descending, take top-k
+        merged = sorted(all_results.values(), key=lambda x: x["score"], reverse=True)
+        logger.info(
+            f"Multi-query search: {len(queries)} queries, "
+            f"{len(all_results)} unique chunks, returning top {limit}"
+        )
+        return merged[:limit]
 
     # ================================================================
     # Knowledge Retrieval (public API)
@@ -705,11 +819,18 @@ class KnowledgeManager:
         enable_advanced: bool = True, include_citations: bool = True,
     ) -> str:
         """
-        Full RAG pipeline: advanced search → return context for LLM.
+        Retrieve knowledge for a question.
 
-        Returns formatted context string ready for LLM consumption.
+        Two modes:
+        - Simple (enable_advanced=False): Pure vector search, fast, no LLM calls.
+        - Advanced (enable_advanced=True): HyDE + MQE + Rerank, slower but better
+          for complex or poorly-matched queries.
+
+        The caller (FactualHandler) decides which mode to use. The pattern is:
+        1. Try simple search first
+        2. If answer is short/empty, retry with advanced
         """
-        if enable_advanced:
+        if enable_advanced and self.llm:
             results = await self.search_advanced(question, limit=limit)
         else:
             results = self.search_simple(question, limit=limit)
@@ -724,6 +845,32 @@ class KnowledgeManager:
 
         if include_citations:
             parts.append(f"\n---\n检索到 {len(results)} 个相关片段")
+
+        return "\n\n".join(parts)
+
+    async def ask_knowledge_multi(
+        self, sub_questions: list[str], limit: int = 5,
+        include_citations: bool = True,
+    ) -> str:
+        """
+        Retrieve knowledge for a compound question by searching each
+        sub-question independently, then merging results.
+
+        No LLM calls — only embedding + vector search per sub-question.
+        Results are deduplicated by document_id + chunk_idx (max-score).
+        """
+        results = self.search_multi_query(sub_questions, limit=limit)
+
+        if not results:
+            return ""
+
+        parts = []
+        for i, r in enumerate(results, 1):
+            doc_title = r.get("metadata", {}).get("title", r["document_id"])
+            parts.append(f"【来源{i}: {doc_title}】\n{r['chunk']}")
+
+        if include_citations:
+            parts.append(f"\n---\n检索到 {len(results)} 个相关片段（来自 {len(sub_questions)} 个子查询）")
 
         return "\n\n".join(parts)
 

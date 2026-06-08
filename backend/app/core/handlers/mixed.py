@@ -51,15 +51,37 @@ SYNTHESIZE_PROMPT = """综合以下子问题分析结果，生成完整连贯的
 1. 整合所有答案，形成连贯整体
 2. 使用markdown格式
 3. 消除重复，逻辑流畅
+4. **必须保留各子问题回答中的来源标注（如 【来源: xxx】），不可删除**
 
 请生成完整答案:"""
+
+# Lightweight prompt for compound factual questions — all sub-questions are
+# simple lookups, so we just need one answer from merged chunks.
+LIGHTWEIGHT_FACTUAL_PROMPT = """You are a Q&A assistant. Answer a multi-part question based on the provided document snippets.
+
+## CRITICAL: Source Citation Rules
+1. **Must cite**: After every fact, add the source like `【来源: 文档名】`
+2. **No source = must say so**: If the retrieved documents don't contain the answer, start with:
+   "⚠️ 知识库中未找到相关信息。以下回答基于通用知识，可能不准确："
+3. **Don't make things up**: Only state facts that appear in the retrieved snippets
+
+## Guidelines:
+1. **Source First**: Always answer from documents first
+2. **Address all parts**: Answer each sub-question the user asked
+3. **Accuracy**: Don't invent facts not in the sources
+4. **Clarity**: Use markdown formatting
+
+## Format:
+- If documents have the answer: 回答 + `【来源: xxx文档】`
+- If not: "⚠️ 未在知识库中找到相关信息。"
+- Use headings to separate different parts of the answer"""
 
 
 class MixedHandler(HandlerInterface):
     """Handler for complex multi-part questions with parallel optimized dispatch."""
 
-    def __init__(self, llm, tool_registry, config, router):
-        super().__init__(llm, tool_registry, config)
+    def __init__(self, llm, tool_registry, config, router, knowledge=None):
+        super().__init__(llm, tool_registry, config, knowledge)
         self.router = router
 
     @property
@@ -90,7 +112,69 @@ class MixedHandler(HandlerInterface):
             from app.core.handlers.factual import FactualHandler
             return await FactualHandler(self.llm, self.tool_registry, self.config, self.knowledge).handle(question, context)
 
-        # --- Phase 2: Parallel dispatch (OPTIMIZATION #1: asyncio.gather) ---
+        # --- Phase 1.5: Check for lightweight path (all factual sub-questions) ---
+        # Classify each sub-question by rules only — no LLM cost.
+        sub_categories = []
+        for sq in sub_questions:
+            rule_result = self.router._classify_by_rules(sq)
+            sub_categories.append(rule_result.category if rule_result else "unknown")
+
+        all_factual = all(c == "factual" for c in sub_categories)
+        has_kb = self.knowledge and self.knowledge.has_knowledge()
+
+        if all_factual and has_kb:
+            # Lightweight path: multi-query search → merge chunks → one LLM answer
+            logger.info(
+                f"[MIXED] All {len(sub_questions)} sub-questions factual, "
+                f"using lightweight multi-query search"
+            )
+            t_light = time.perf_counter()
+
+            # Search each sub-question independently, merge results
+            kb_context = await self.knowledge.ask_knowledge_multi(
+                sub_questions, limit=8, include_citations=True
+            )
+
+            steps.append(StepInfo(
+                step_number=2,
+                thought="所有子问题均为事实查询，并行检索知识库",
+                action=f"多查询检索 ({len(sub_questions)}个子查询)",
+                observation=kb_context[:500] if kb_context else "(未找到相关内容)",
+                duration_ms=int((time.perf_counter() - t_light) * 1000),
+            ))
+
+            # One LLM call to answer
+            t_gen = time.perf_counter()
+            messages = [
+                {"role": "system", "content": LIGHTWEIGHT_FACTUAL_PROMPT},
+                {"role": "user", "content": (
+                    f"## 用户问题\n{question}\n\n"
+                    f"## 知识库检索结果\n{kb_context if kb_context else '未找到相关文档。'}"
+                )},
+            ]
+            answer = await asyncio.to_thread(self.llm.invoke, messages)
+            gen_ms = int((time.perf_counter() - t_gen) * 1000)
+
+            steps.append(StepInfo(
+                step_number=3,
+                thought="基于检索结果综合回答",
+                action="生成综合回答",
+                observation=answer[:500],
+                duration_ms=gen_ms,
+            ))
+
+            total_ms = int((time.perf_counter() - start_time) * 1000)
+            logger.info(
+                f"[MIXED] Lightweight complete | {len(sub_questions)} sub-Qs | "
+                f"total={total_ms}ms | kb_chars={len(kb_context)}"
+            )
+
+            return HandlerResult(
+                answer=answer, steps=steps,
+                tool_calls=[], total_duration_ms=total_ms,
+            )
+
+        # --- Phase 2: Parallel dispatch (full handler per sub-question) ---
         t1 = time.perf_counter()
 
         async def process_one(i: int, sub_q: str) -> dict:

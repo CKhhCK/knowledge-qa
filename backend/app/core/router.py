@@ -14,6 +14,7 @@ Categories:
 - mixed: Complex multi-part questions
 """
 
+import asyncio
 import json
 import re
 from typing import Optional
@@ -71,14 +72,19 @@ ROUTER_SYSTEM_PROMPT = """你是一个问题分类专家。你的任务是分析
    - 例: "CNN和Transformer有什么区别？" "Python和Java哪个更适合后端开发？"
 
 4. **calculation** (计算性/数学性)
-   - 涉及数学运算、公式计算、数值推理
-   - 关键词: 包含数字和运算符、"计算"、"求解"、"等于多少"
+   - 涉及数学运算、公式计算，需要实际执行加减乘除
+   - 关键词: 包含明确的数字和运算符、"计算"、"求解"、"等于多少"
+   - **重要**: 如果问题询问某个产品参数/配置的数值（如"降低多少显存"、"提升多少吞吐量"），
+     这属于 factual（查文档），不是 calculation（算数学）
    - 例: "计算 123 * 456" "144的平方根是多少？"
+   - 反例: "模型量化INT8可以降低多少显存？" → factual（查文档参数，不是算数学）
 
 5. **mixed** (混合性/复合性)
-   - 包含多个子问题、需要多种能力组合
-   - 特征: 问题较长，包含多个问号或多个独立任务
-   - 例: "什么是RAG？它和传统检索有什么区别？如何实现一个基础的RAG系统？"
+   - 包含多个并列的子问题，即使用"和"、"以及"、"还有"等连接词将多个独立问题合并
+   - 特征: 问题较长，包含多个问号，或用"和/以及/还有/并"连接了多个独立话题
+   - 例1: "什么是RAG？它和传统检索有什么区别？如何实现一个基础的RAG系统？"
+   - 例2: "公司的技术栈和网络延迟要求是什么？"（两个独立问题用"和"连接）
+   - 例3: "公司安全认证有哪些？加密标准是什么？"（多个问句）
 
 ## 输出格式:
 请严格输出以下JSON格式:
@@ -103,26 +109,45 @@ class QuestionRouter:
 
     # --- Rule-based patterns ---
     FACTUAL_PATTERNS = [
-        r"什么是", r"是谁", r"何时", r"什么时候", r"在哪里",
-        r"定义", r"列出", r"有哪些", r"告诉我关于",
-        r"标准是多少", r"怎么规定", r"怎么处理", r"怎么.*处理", r"多少天",
-        r"怎么报销", r"怎么请假", r"多少.*标准", r"有没有", r"是否",
+        # "是什么" / "什么是" — most common factual pattern
+        r"是什么", r"什么是",
+        # "是谁" / "何时" / "在哪里"
+        r"是谁", r"何时", r"什么时候", r"在哪里", r"在哪",
+        # Numeric/standard lookups (these are doc lookups, not calculations)
+        r"是多少", r"有多少", r"多少天", r"多少.*标准",
+        r"降低多少", r"提升多少", r"减少多少", r"占比多少",
+        r"多少$",  # "XX多少" — factual lookup ending with 多少
+        # Listing/enumeration
+        r"有哪些", r"支持哪些", r"包含什么", r"列出", r"定义",
+        # Policy/rule questions
+        r"怎么规定", r"怎么处理", r"怎么报销", r"怎么请假",
+        r"怎么.*解决", r"标准是", r"有没有", r"是否",
+        # Compound indicators (will be overridden by mixed detection)
+        r"告诉我关于",
+        # English patterns
         r"^what is", r"^who is", r"^where is", r"^when (did|was)",
         r"^define", r"^list", r"^tell me about",
     ]
 
     REASONING_PATTERNS = [
-        r"为什么", r"为何", r"如何", r"怎么", r"怎样",
-        r"原因", r"原理", r"机制", r"过程", r"步骤",
+        # Causal / explanatory
+        r"为什么", r"为何", r"原因", r"原理",
+        # How-to (with context, not bare "怎么")
+        r"如何", r"怎样", r"怎么解决", r"怎么实现", r"怎么做",
+        r"怎么处理", r"怎么优化", r"怎么配置", r"怎么部署",
+        # Process / steps
+        r"机制", r"过程", r"步骤",
+        # English patterns
         r"^why", r"^how", r"^explain", r"^describe the process",
     ]
 
     COMPARISON_PATTERNS = [
         r"对比", r"比较", r"区别", r"不同", r"差异",
-        r"哪个更", r"哪个比较好", r"优缺点", r"优劣",
+        r"哪个更", r"哪个好", r"哪个比较好", r"优缺点", r"优劣",
+        r"相比", r"有何不同", r"有什么不同",
         r"vs\.?", r" versus ",
         r"^compare", r"^what.*difference", r"^which.*better",
-        r"和.*区别", r"和.*不同", r"与.*对比",
+        r"和.*区别", r"和.*不同", r"与.*对比", r"与.*区别",
     ]
 
     CALCULATION_PATTERNS = [
@@ -133,6 +158,17 @@ class QuestionRouter:
         r"^what is \d+",
     ]
 
+    # Compound question connectors (suggests multiple sub-questions)
+    # Match patterns like: "A和B是什么" / "A以及B有哪些" / "A、B和C的X"
+    COMPOUND_CONNECTORS = [
+        # Connector with question word somewhere after
+        r"[和以及、还有并与]\s*\S+\s*(?:是|有|包含|支持|要求|规定|属于|需要).*(?:什么|哪些|多少|怎么|如何|怎样|是什么|是多少)",
+        # Two question words connected by "和/以及/还有"
+        r"(?:什么|哪些|多少|怎么|如何|是怎样).*[和以及还有并].*(?:什么|哪些|多少|怎么|如何|是怎样)",
+        # Simple connector detection for longer questions
+        r"^.{10,}[和以及还有并与].{5,}(?:什么|哪些|多少|怎么|如何|是谁|是什么|是多少)",
+    ]
+
     def __init__(self, llm: HelloAgentsLLM):
         """Initialize the router with an LLM client for fallback classification."""
         self.llm = llm
@@ -140,6 +176,7 @@ class QuestionRouter:
         self._compiled_reasoning = [re.compile(p, re.IGNORECASE) for p in self.REASONING_PATTERNS]
         self._compiled_comparison = [re.compile(p, re.IGNORECASE) for p in self.COMPARISON_PATTERNS]
         self._compiled_calculation = [re.compile(p, re.IGNORECASE) for p in self.CALCULATION_PATTERNS]
+        self._compiled_compound = [re.compile(p, re.IGNORECASE) for p in self.COMPOUND_CONNECTORS]
         # Cache: question → ClassificationResult (avoids repeated LLM calls for similar questions)
         self._cache: dict[str, ClassificationResult] = {}
         self._cache_max = 200
@@ -195,13 +232,23 @@ class QuestionRouter:
                 confidence=0.95, reasoning="纯数学表达式",
             )
 
-        # Check for mixed: multiple question marks or very long
+        # Check for mixed: multiple question marks
         question_marks = question.count("?") + question.count("？")
         if question_marks >= 2 and len(question) > 15:
             return ClassificationResult(
                 category="mixed",
-                confidence=0.7,
+                confidence=0.65,
                 reasoning=f"检测到{question_marks}个问句，判定为复合问题",
+            )
+
+        # Check for mixed: compound connectors suggesting multiple sub-questions
+        compound_score = self._count_matches(question, self._compiled_compound)
+        if compound_score > 0 and len(question) > 10:
+            # Has compound connectors — likely mixed, but let LLM confirm
+            return ClassificationResult(
+                category="mixed",
+                confidence=0.55,
+                reasoning="检测到并列结构，可能包含多个子问题",
             )
 
         # Find the highest scoring category (factual gets tiebreaker over reasoning)
@@ -221,7 +268,7 @@ class QuestionRouter:
         if confidence >= 0.5:
             return ClassificationResult(
                 category=max_category, complexity=complexity,
-                confidence=min(confidence, 0.85),
+                confidence=min(confidence, 0.70),
                 reasoning=f"关键词匹配: {max_category}类模式得分最高",
             )
 
